@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ja">
+<!--
+  ニシキ運送 音声入力ページ（外部ホスティング専用 / スタンドアロン）
+  ────────────────────────────────────────────────────────────
+  ★このファイルは GAS には置かず、GitHub Pages / Vercel / Netlify などの
+    「Googleドメイン外」の静的ホスティングに配置してください。
+    （GAS=script.google.com から配信すると Google のラッパー iframe に
+      マイク制限がかかり、Web Speech が not-allowed で永久に失敗するため）
+
+  デプロイ手順（例：GitHub Pages）:
+    1. このファイルを公開リポジトリに index.html 等として置く
+    2. Settings → Pages を有効化（例：https://<user>.github.io/<repo>/voice-input.html）
+    3. 発行された URL を html/index.html の  var AI_MIC_PAGE_URL = '...';  に貼る
+
+  動作:
+    - パターンA（1タップ開始 / 喋り終わるまで継続 / 無音で自動確定）
+    - 録音中は赤く点滅
+    - 確定したら window.opener.postMessage(text, '*') で親(受注画面)へ送信し自動で閉じる
+  ────────────────────────────────────────────────────────────
+-->
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>音声で入力 | ニシキ運送</title>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; padding: 0; height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
+      background: #0f172a; color: #f1f5f9;
+    }
+    body {
+      display: flex; flex-direction: column;
+      min-height: 100dvh; padding: 24px 18px calc(24px + env(safe-area-inset-bottom));
+    }
+    .mic-head { text-align: center; margin-bottom: 8px; }
+    .mic-head h1 { font-size: 18px; margin: 0 0 4px; font-weight: 700; }
+    .mic-head p { margin: 0; font-size: 13px; color: #94a3b8; }
+    .mic-stage {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 22px;
+    }
+    .mic-btn {
+      width: 200px; height: 200px; border-radius: 50%;
+      border: none; cursor: pointer; outline: none;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 8px; color: #fff; font-size: 17px; font-weight: 700;
+      background: #16a34a; box-shadow: 0 10px 30px rgba(22,163,74,.45);
+      transition: transform .12s ease, background .2s ease, box-shadow .2s ease;
+    }
+    .mic-btn:active { transform: scale(.96); }
+    .mic-btn .ico { font-size: 64px; line-height: 1; }
+    .mic-btn.listening {
+      background: #dc2626;
+      box-shadow: 0 0 0 0 rgba(220,38,38,.7);
+      animation: pulse 1.2s infinite;
+    }
+    @keyframes pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(220,38,38,.65); }
+      70%  { box-shadow: 0 0 0 26px rgba(220,38,38,0); }
+      100% { box-shadow: 0 0 0 0 rgba(220,38,38,0); }
+    }
+    .mic-status { font-size: 16px; font-weight: 700; min-height: 24px; text-align: center; }
+    .mic-status.rec { color: #fca5a5; }
+    .mic-transcript {
+      width: 100%; max-width: 480px; min-height: 96px;
+      background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12);
+      border-radius: 14px; padding: 14px 16px; font-size: 17px; line-height: 1.6;
+      color: #e2e8f0; white-space: pre-wrap; word-break: break-word;
+    }
+    .mic-transcript:empty::before { content: "ここに認識した文章が表示されます"; color: #64748b; }
+    .mic-actions { display: flex; gap: 12px; width: 100%; max-width: 480px; }
+    .mic-actions button {
+      flex: 1; padding: 16px 12px; border-radius: 12px; border: none;
+      font-size: 16px; font-weight: 700; cursor: pointer;
+    }
+    .btn-send { background: #2563eb; color: #fff; }
+    .btn-send:disabled { background: #334155; color: #64748b; cursor: default; }
+    .btn-cancel { background: rgba(255,255,255,.08); color: #cbd5e1; }
+    .mic-error {
+      max-width: 480px; width: 100%; text-align: center; color: #fca5a5;
+      font-size: 14px; line-height: 1.6; display: none;
+    }
+    .mic-error.show { display: block; }
+  </style>
+</head>
+<body>
+  <div class="mic-head">
+    <h1>🎤 音声で入力</h1>
+    <p>ボタンを押して話してください。話し終わると自動で受注画面に反映されます。</p>
+  </div>
+
+  <div class="mic-stage">
+    <button type="button" id="mic-btn" class="mic-btn">
+      <span class="ico">🎤</span>
+      <span id="mic-btn-label">押して話す</span>
+    </button>
+    <div id="mic-status" class="mic-status">準備中…</div>
+    <div id="mic-transcript" class="mic-transcript"></div>
+    <div id="mic-error" class="mic-error"></div>
+    <div class="mic-actions">
+      <button type="button" id="mic-cancel" class="btn-cancel">閉じる</button>
+      <button type="button" id="mic-send" class="btn-send" disabled>この内容で反映</button>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      var btn      = document.getElementById('mic-btn');
+      var btnLabel = document.getElementById('mic-btn-label');
+      var statusEl = document.getElementById('mic-status');
+      var transEl  = document.getElementById('mic-transcript');
+      var errEl    = document.getElementById('mic-error');
+      var sendBtn  = document.getElementById('mic-send');
+      var cancelBtn= document.getElementById('mic-cancel');
+
+      var recog = null;
+      var listening = false;
+      var finalText = '';
+      var silenceTimer = null;
+      var SILENCE_MS = 3500; // 発話が途切れてから自動確定するまでの猶予（パターンA）
+
+      function showError(msg) { errEl.textContent = msg; errEl.classList.add('show'); }
+      function clearError() { errEl.textContent = ''; errEl.classList.remove('show'); }
+
+      function setUI(isRec) {
+        listening = isRec;
+        if (isRec) {
+          btn.classList.add('listening');
+          btnLabel.textContent = '聞き取り中…';
+          statusEl.textContent = '● 録音中… 話し終わったら少し待ってください';
+          statusEl.classList.add('rec');
+        } else {
+          btn.classList.remove('listening');
+          btnLabel.textContent = '押して話す';
+          statusEl.classList.remove('rec');
+        }
+      }
+      function clearSilence() { if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; } }
+      function resetSilence() {
+        clearSilence();
+        silenceTimer = setTimeout(function () { stopListening(); }, SILENCE_MS);
+      }
+
+      function buildRecog() {
+        var r = new SR();
+        r.lang = 'ja-JP';
+        r.continuous = true;     // パターンA：勝手に切らず聞き続ける
+        r.interimResults = true; // 聞き取り中の文字を即可視化
+        r.maxAlternatives = 1;
+
+        r.onstart      = function () { setUI(true); resetSilence(); };
+        r.onaudiostart = function () { resetSilence(); };
+        r.onspeechstart= function () { clearSilence(); };
+        r.onresult = function (ev) {
+          var interim = '';
+          for (var i = ev.resultIndex; i < ev.results.length; i++) {
+            var res = ev.results[i];
+            if (res.isFinal) finalText += res[0].transcript;
+            else interim += res[0].transcript;
+          }
+          transEl.textContent = (finalText + interim).trim();
+          sendBtn.disabled = !((finalText + interim).trim());
+          resetSilence(); // 声を拾うたびリセット＝喋り続ける限り切れない
+        };
+        r.onerror = function (ev) {
+          if (ev.error === 'no-speech') { resetSilence(); return; }
+          if (ev.error === 'aborted') { return; }
+          if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+            showError('マイクの使用が許可されていません。アドレスバーのマイク許可をオンにして、もう一度お試しください。');
+          } else if (ev.error === 'network') {
+            showError('ネットワークエラーです。通信状況を確認してもう一度お試しください。');
+          } else {
+            showError('音声認識でエラーが発生しました（' + ev.error + '）。もう一度お試しください。');
+          }
+          stopListening();
+        };
+        r.onend = function () {
+          // continuous でも端末によって途中で end する。停止指示が無ければ再開して聞き続ける。
+          if (listening) { try { r.start(); return; } catch (e) {} }
+          setUI(false);
+          clearSilence();
+        };
+        return r;
+      }
+
+      function startListening() {
+        clearError();
+        if (!SR) {
+          showError('この端末／ブラウザは音声認識に対応していません。キーボードのマイクをご利用ください。');
+          statusEl.textContent = '非対応';
+          return;
+        }
+        finalText = '';
+        transEl.textContent = '';
+        sendBtn.disabled = true;
+        try { recog = buildRecog(); recog.start(); }
+        catch (e) { showError('マイクを起動できませんでした。もう一度お試しください。'); setUI(false); }
+      }
+
+      function stopListening() {
+        clearSilence();
+        var was = listening;
+        listening = false;
+        if (recog) { try { recog.stop(); } catch (e) {} }
+        setUI(false);
+        if (was) {
+          statusEl.textContent = finalText.trim()
+            ? '認識しました。「この内容で反映」を押してください'
+            : '聞き取れませんでした。もう一度お試しください';
+        }
+      }
+
+      function getOpener() {
+        try { if (window.opener && !window.opener.closed) return window.opener; } catch (e) {}
+        try { if (window.top && window.top.opener) return window.top.opener; } catch (e) {}
+        return null;
+      }
+      function closeSelf() {
+        try { window.close(); } catch (e) {}
+        try { if (window.top) window.top.close(); } catch (e) {}
+      }
+      function sendBack() {
+        var text = (finalText || transEl.textContent || '').trim();
+        if (!text) { showError('送信する文章がありません。もう一度話してください。'); return; }
+        var op = getOpener();
+        if (op) { try { op.postMessage(text, '*'); } catch (e) {} }
+        statusEl.textContent = '受注画面に反映しました。閉じます…';
+        setTimeout(closeSelf, 300);
+      }
+
+      btn.addEventListener('click', function () {
+        if (listening) stopListening(); else startListening();
+      });
+      sendBtn.addEventListener('click', sendBack);
+      cancelBtn.addEventListener('click', function () { stopListening(); closeSelf(); });
+
+      // 開いた直後に自動で録音開始（ユーザーのタップで開かれているのでジェスチャー要件OK）
+      window.addEventListener('load', function () { setTimeout(startListening, 250); });
+    })();
+  </script>
+</body>
+</html>
